@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nexusops-deployment
+  labels:
+    app: nexusops
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nexusops
+  template:
+    metadata:
+      labels:
+        app: nexusops
+    spec:
+      containers:
+      - name: nexusops
+        image: nexusops:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+        env:
+        - name: PINECONE_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: nexusops-secrets
+              key: pinecone-api-key
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: nexusops-secrets
+              key: github-token
+        - name: SLACK_WEBHOOK_URL
+          valueFrom:
+            secretKeyRef:
+              name: nexusops-secrets
+              key: slack-webhook-url
+        resources:
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nexusops-service
+spec:
+  selector:
+    app: nexusops
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8000
+  type: LoadBalancer

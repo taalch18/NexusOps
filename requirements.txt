@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+pinecone
+pydantic
+python-dotenv
+httpx
+numpy
+sentence-transformers
+langgraph
+langchain
+mcp
+kubernetes
+PyGithub
+requests
+PyGithub
+ragas
+sentence-transformers
