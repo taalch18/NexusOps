@@ -1,71 +1,117 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from pydantic import BaseModel
-from typing import List, Dict, Optional
 import time
 import uuid
-from vector_store_wrapper import VectorStoreWrapper
+import logging
+from typing import List, Dict, Optional
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="NexusOps Ingestion Engine")
+from fastapi import FastAPI, HTTPException, BackgroundTasks, status
+from pydantic import BaseModel, Field
+from vector_store_wrapper import NexusVectorClient  # Updated to match our humanized client
 
-# Global Vector Store Instance
-vector_store: Optional[VectorStoreWrapper] = None
+# Standardized SRE logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - NexusIngest - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-@app.on_event("startup")
-async def startup_event():
-    global vector_store
-    # Initialize with mock mode allowed if keys are missing
-    vector_store = VectorStoreWrapper()
-    print("Vector Store Initialized")
+# Global state for the vector client
+vector_client: Optional[NexusVectorClient] = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Manages the application lifecycle. 
+    Ensures the vector database connection is established before the API goes live.
+    """
+    global vector_client
+    try:
+        vector_client = NexusVectorClient()
+        await vector_client.connect()
+        logger.info("Service operational: NexusVectorClient connected.")
+        yield
+    except Exception as e:
+        logger.critical(f"Service startup failed: {str(e)}")
+        raise RuntimeError("Vector Store connection required for startup.")
+
+app = FastAPI(
+    title="NexusOps Ingestion API",
+    description="High-throughput ingestion engine for SRE playbooks and log context.",
+    lifespan=lifespan
+)
 
 class DocumentChunk(BaseModel):
-    text: str
-    metadata: Optional[Dict] = {}
+    text: str = Field(..., min_length=1, description="The raw text content to be vectorized.")
+    metadata: Dict = Field(default_factory=dict, description="Structured tags for filtering.")
 
 class IngestionResponse(BaseModel):
     status: str
     count: int
     batch_id: str
+    latency_ms: float
 
-@app.post("/ingest", response_model=IngestionResponse)
-async def ingest_documents(chunks: List[DocumentChunk], background_tasks: BackgroundTasks):
+@app.post(
+    "/v1/ingest", 
+    response_model=IngestionResponse,
+    status_code=status.HTTP_201_CREATED
+)
+async def ingest_playbooks(chunks: List[DocumentChunk]):
     """
-    Asynchronous ingestion endpoint.
-    Accepts text chunks, generates embeddings (via wrapper), and upserts to Pinecone.
+    Processes and upserts a batch of documents into the vector store.
+    Generates UUIDs and timestamps for each record to ensure auditability.
     """
-    if not vector_store:
-        raise HTTPException(status_code=503, detail="Vector Store not initialized")
+    if not vector_client:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, 
+            detail="Ingestion engine is currently disconnected from the vector store."
+        )
 
     batch_id = str(uuid.uuid4())
+    start_time = time.perf_counter()
     
-    # Prepare documents for upsert
-    documents = []
+    # Prepare payload with system-level metadata
+    payload = []
     for chunk in chunks:
-        doc_id = str(uuid.uuid4())
-        documents.append({
-            "id": doc_id,
+        payload.append({
+            "id": str(uuid.uuid4()),
             "text": chunk.text,
-            "metadata": {**chunk.metadata, "batch_id": batch_id, "timestamp": time.time()}
+            "metadata": {
+                **chunk.metadata, 
+                "ingest_batch": batch_id, 
+                "ingest_ts": time.time()
+            }
         })
 
-    # Execute Upsert
-    # In a real heavy-load scenario, we might push to a queue (Celery/Kafka), 
-    # but for this phase using FastAPI background tasks or direct async await is acceptable.
-    # The prompt asks for "Asynchronous handling". 
-    # Since VectorStoreWrapper.upsert is async, we can await it directly or schedule it.
-    # To demonstrate "pipeline" behavior, let's await it to report success/failure 
-    # but we could also use background_tasks.add_task(vector_store.upsert, documents)
-    
-    start_time = time.time()
     try:
-        count = await vector_store.upsert(documents)
+        # Utilizing our 'sync_logs' method which already handles thread-offloading
+        count = await vector_client.sync_logs(payload)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
+        logger.error(f"Batch ingestion failed for ID {batch_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail="Failed to commit batch to vector index."
+        )
     
-    duration = time.time() - start_time
-    print(f"Ingested {count} documents in {duration:.4f}s")
+    duration_ms = (time.perf_counter() - start_time) * 1000
+    logger.info(f"Batch {batch_id} complete: {count} docs in {duration_ms:.2f}ms")
 
-    return IngestionResponse(status="success", count=count, batch_id=batch_id)
+    return IngestionResponse(
+        status="success", 
+        count=count, 
+        batch_id=batch_id,
+        latency_ms=round(duration_ms, 2)
+    )
 
-@app.get("/health")
+@app.get("/health", tags=["Observability"])
 async def health_check():
-    return {"status": "operational", "mode": "mock" if vector_store.use_mocks else "production"}
+    """
+    Liveness and Readiness probe for Kubernetes orchestration.
+    """
+    if vector_client and vector_client.index:
+        return {
+            "status": "healthy",
+            "uptime": "operational",
+            "dependencies": {"vector_store": "connected"}
+        }
+    
+    return {
+        "status": "degraded",
+        "dependencies": {"vector_store": "disconnected"}
+    }, status.HTTP_503_SERVICE_UNAVAILABLE
