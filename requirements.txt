@@ -1,17 +1,28 @@
+# --- Core API & UI Layer ---
 fastapi
 uvicorn
-pinecone
-pydantic
-python-dotenv
+streamlit
+requests
 httpx
-numpy
-sentence-transformers
+python-dotenv
+
+# --- Reasoning & Orchestration ---
 langgraph
 langchain
+langchain-groq
+pydantic
+
+# --- Knowledge & Vector Layer ---
+pinecone[grpc]
+numpy
+# Forces CPU-only versions to keep Docker image size < 1.5GB
+--extra-index-url https://download.pytorch.org/whl/cpu
+sentence-transformers
+
+# --- Infrastructure & Tooling ---
 mcp
 kubernetes
 PyGithub
-requests
-PyGithub
+
+# --- Evaluation ---
 ragas
-sentence-transformers
