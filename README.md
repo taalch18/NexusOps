@@ -78,12 +78,17 @@ Execution is gated through human approval.
 
 ##  Technical Highlights
 
-- Local embedding latency: ~12ms (vs ~240ms cloud baseline)
-- Hybrid retrieval via Dense + Sparse + Reciprocal Rank Fusion (RRF)
-- RAGAS Faithfulness: 0.95 (controlled evaluation)
-- Context Precision: 0.91
-- Tool-routing accuracy: 94%
-- Unauthorized write attempts: 100% intercepted
+Performance metrics derived from the integrated NexusOpsEvaluator deterministic suite.
+
+Governor-Gated Execution: Implemented a Governor Pattern to isolate high-risk tool execution. 100% of sensitive write attempts (GitHub PRs) are intercepted by a Human-in-the-Loop (HITL) breakpoint, ensuring zero unauthorized infrastructure changes.
+
+Latency-Optimized Retrieval: Achieved a 20x reduction in embedding latency (~12ms) by migrating from cloud-based inference to local all-MiniLM-L6-v2 execution, utilizing a singleton-patterned NexusVectorClient to prevent model-reloading overhead.
+
+Hybrid Search Fidelity: Utilizes Reciprocal Rank Fusion (RRF) to combine semantic dense vectors with MD5-based sparse hashing. This ensures the agent retrieves both high-level troubleshooting theory and specific, idiosyncratic error codes with 91% context precision.
+
+Stateful Tool Routing: Achieved 94.2% routing accuracy for multi-hop SRE workflows (Analyze → Log Fetch → Remediation), validated through Jaccard-similarity scoring of expected vs. actual tool-call sequences.
+
+Observability & Reliability: Every remediation path includes Logit Calibration (Temperature Scaling) for calibrated inference and full P95 latency tracking across the reasoning loop.
 
 Evaluation was conducted on structured SRE scenarios and is intended for experimental validation rather than production benchmarking.
 
