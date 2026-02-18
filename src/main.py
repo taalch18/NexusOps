@@ -1,111 +1,91 @@
 import asyncio
-import os
+import uuid
+import sys
+import logging
 from dotenv import load_dotenv
 
-# Import the Orchestrator and Knowledge Base
-from graph_orchestrator import GraphOrchestrator, search_knowledge_base
-from slack_approver import slack_approver
+from graph_orchestrator import GraphOrchestrator
+from slack_approver import governor  # Using the humanized 'governor' instance
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
-# LangChain core components
-# Added ToolMessage here to fix the Execution Error
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage 
-from langchain_core.tools import tool
-
-# MCP Server call wrappers
-from mcp_tools.k8s_server import call_tool as k8s_call
-from mcp_tools.github_server import call_tool as gh_call
+# Configure logging for the main runner
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - NexusOps - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# --- Production Tools with Human-in-the-Loop (HITL) ---
-
-@tool
-async def get_pod_logs(pod_name: str, namespace: str = "default"):
-    """Fetches real-time logs from a Kubernetes pod via MCP to diagnose crashes."""
-    res = await k8s_call("get_pod_logs", {"pod_name": pod_name, "namespace": namespace})
-    # MCP returns a list of content blocks; we extract the text
-    return res[0].text if hasattr(res[0], 'text') else str(res)
-
-@tool
-async def create_pull_request(repo_name: str, title: str, body: str, head: str):
-    """Drafts a Pull Request on GitHub. Requires manual approval via Slack."""
-    print(f"\n[INTERCEPT] High-Risk Action Detected: Create PR on {repo_name}")
+async def run_session():
+    """
+    Main execution loop for the NexusOps SRE agent.
+    Handles graph orchestration, state-based breakpoints, and HITL resumption.
+    """
+    orchestrator = GraphOrchestrator()
+    nexus_app = orchestrator.build_graph()
     
-    # Request Approval via Slack Webhook
-    approved = slack_approver.request_approval(
-        f"PROPOSAL: Create PR '{title}' on {repo_name}\nSummary: {body[:100]}..."
-    )
+    # Persistent thread ID for state management across breakpoints
+    session_id = str(uuid.uuid4())
+    config = {"configurable": {"thread_id": session_id}}
     
-    if approved:
-        try:
-            res = await gh_call("create_pull_request", {
-                "repo_name": repo_name,
-                "title": title,
-                "body": body,
-                "head": head
-            })
-            return res[0].text if hasattr(res[0], 'text') else "PR Created Successfully."
-        except Exception as e:
-            return f"Failed to create PR: {str(e)}"
-    else:
-        return "Action Denied by User via Slack Gatekeeper."
-
-# --- Execution Logic ---
-
-async def main():
-    # 1. Define the toolset for the agent
-    # We pass these into the orchestrator so the graph nodes can bind them
-    tools = [search_knowledge_base, get_pod_logs, create_pull_request]
-    
-    # 2. Initialize orchestrator with specific tools
-    orchestrator = GraphOrchestrator(tools=tools)
-    app = orchestrator.build_graph()
-    
-    print("\n=== NexusOps: Autonomous Agentic RAG System (Production) ===")
-    print("--- Agent Ready. Monitoring Cluster Status ---")
+    print("\n" + "="*60)
+    print(f" NEXUSOPS: AGENTIC SRE RUNTIME | SESSION: {session_id[:8]}")
+    print("="*60)
+    print("System ready. Type 'exit' to terminate.\n")
 
     while True:
-        user_input = input("\nUser: ").strip()
-        if user_input.lower() in ["exit", "quit"]:
-            break
-
-        print("\n[Processing] Sending query to LangGraph orchestrator...")
-        
-        # Initialize the state with the user's message
-        inputs = {"messages": [HumanMessage(content=user_input)]}
-        
         try:
-            # Stream the graph execution to observe node transitions (agent -> tools -> agent)
-            async for output in app.astream(inputs):
-                for key, value in output.items():
-                    if "messages" in value:
-                        last_msg = value["messages"][-1]
-                        
-                        # Handle varied message formats (tuples vs objects)
-                        if isinstance(last_msg, tuple):
-                            content = last_msg[0].content
-                        elif hasattr(last_msg, 'content'):
-                            content = last_msg.content
-                        else:
-                            content = str(last_msg)
-
-                        # Logic to display output based on node type
-                        if isinstance(last_msg, ToolMessage):
-                            print(f"[{key}] 🛠️ Tool Result: {content[:200]}...")
-                        elif isinstance(last_msg, AIMessage):
-                            if last_msg.tool_calls:
-                                print(f"[{key}] 🤔 Thinking: Calling {last_msg.tool_calls[0]['name']}...")
-                            else:
-                                print(f"[{key}] 🤖 Agent: {content}")
-
-            print("\n--- Cycle Complete ---")
+            query = input("SRE-Prompt >> ").strip()
             
+            if query.lower() in ["exit", "quit"]:
+                print("Gracefully shutting down.")
+                break
+            if not query:
+                continue
+
+            state_input = {"messages": [HumanMessage(content=query)]}
+            
+            # Streaming the graph execution
+            async for event in nexus_app.astream(state_input, config=config, stream_mode="values"):
+                msg = event["messages"][-1]
+                
+                if isinstance(msg, ToolMessage):
+                    logger.info(f"Execution successful: {msg.name}")
+                elif isinstance(msg, AIMessage):
+                    if msg.tool_calls:
+                        for call in msg.tool_calls:
+                            print(f"[*] Agent planning action: {call['name']}...")
+                    elif msg.content:
+                        print(f"\n[NexusOps]: {msg.content}\n")
+
+            # Check for Governor Breakpoints (Human-in-the-Loop)
+            current_state = nexus_app.get_state(config)
+            
+            if current_state.next and current_state.next[0] == "sensitive_tools":
+                # Intercept sensitive actions for manual validation
+                pending_call = current_state.values["messages"][-1].tool_calls[0]
+                context = f"{pending_call['name']} ({pending_call['args']})"
+                
+                governor.dispatch_alert(context)
+                if governor.await_validation():
+                    print("[!] Authorization received. Resuming workflow...")
+                    
+                    # Passing None to resume from the checkpointed state
+                    async for event in nexus_app.astream(None, config=config, stream_mode="values"):
+                        msg = event["messages"][-1]
+                        
+                        if isinstance(msg, ToolMessage):
+                            logger.info(f"Resumed execution successful: {msg.name}")
+                        elif isinstance(msg, AIMessage) and msg.content and not msg.tool_calls:
+                            print(f"\n[NexusOps Final]: {msg.content}\n")
+                else:
+                    logger.warning("Action aborted by operator. Returning to standby.")
+
+        except EOFError:
+            break
         except Exception as e:
-            # This will now catch structural errors without crashing the loop
-            print(f"Execution Error: {str(e)}")
+            logger.error(f"Runtime Exception: {str(e)}")
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(run_session())
     except KeyboardInterrupt:
-        print("\nNexusOps shutting down gracefully.")
+        sys.exit(0)
